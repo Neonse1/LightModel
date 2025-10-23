@@ -14,6 +14,7 @@ constexpr double PI = 3.14159265358979323846;
 constexpr int MAX_REFLECTIONS_DEFAULT = 10000;  // Кап отражений
 constexpr double THRESHOLD_INTENSITY =
     1.0 / 510.0;  // Минимальная яркость луча, иначе – выход
+
 // ------------------- Вспомогательные структуры -------------------
 struct Point {
   double x, y;
@@ -459,4 +460,233 @@ static TraceResult traceRay(const Config& cfg) {
   return res;
 }
 
-int main() { return 0; }
+// ----------- Пример конфига (12 точек, невыпуклый многоугольник) -----------
+static Config buildExampleConfig() {
+  Config cfg;
+  cfg.points = {{100, 100}, {300, 80},  {500, 120}, {620, 220},
+                {580, 360}, {420, 400}, {300, 350}, {220, 420},
+                {120, 380}, {80, 260},  {60, 180},  {90, 140}};
+  size_t n = cfg.points.size();
+  cfg.walls.clear();
+  for (size_t i = 0; i < n; ++i) {
+    WallConfig w;
+    w.idxA = (int)i;
+    w.idxB = (int)((i + 1) % n);
+    // назначим некоторые стены сферическими:
+    if (i == 1) {
+      w.type = WallType::SPHERICAL_CONVEX;
+      w.radius = 160.0;
+    }  // выпуклая (внутрь)
+    else if (i == 3) {
+      w.type = WallType::SPHERICAL_CONCAVE;
+      w.radius = 200.0;
+    }  // вогнутая наружу
+    else if (i == 6) {
+      w.type = WallType::SPHERICAL_CONVEX;
+      w.radius = 120.0;
+    } else if (i == 9) {
+      w.type = WallType::SPHERICAL_CONCAVE;
+      w.radius = 140.0;
+    } else {
+      w.type = WallType::FLAT;
+    }
+    cfg.walls.push_back(w);
+  }
+  // настройки луча
+  cfg.emit_wall_index =
+      1;  // начать с первой стенки (которая у нас сферическая выпуклая)
+  cfg.emit_wall_t = 0.35;  // между 0 и 1, концах не включая
+  cfg.emit_angle_deg = 40.0;  // от 0 до 180
+  cfg.reflectivity = 0.8;     // коэф отражения
+  cfg.target_point = Point(420, 300);
+  cfg.target_radius = 2.0;
+  cfg.max_reflections = MAX_REFLECTIONS_DEFAULT;
+  cfg.return_on_hit = false;
+  // инициализация центров сферы:
+  bool ok = initializeWalls(cfg);
+  if (!ok) std::cerr << "Ошибка инициализации стен\n";
+  return cfg;
+}
+
+// ------------------- Сохранение конфигурации -------------------
+static bool SaveConfig(const std::string& filename, const Config& cfg) {
+  std::ofstream out("templates/" + filename);
+  if (!out.is_open()) {
+    std::cerr << "SaveConfig: не удалось открыть файл для записи: " << filename
+              << "\n";
+    return false;
+  }
+
+  // --- Точки ---
+  out << cfg.points.size() << "\n";
+  for (const auto& p : cfg.points) out << p.x << " " << p.y << "\n";
+
+  // --- Стены (только базовые данные, без center/углов) ---
+  out << cfg.walls.size() << "\n";
+  for (const auto& w : cfg.walls)
+    out << static_cast<int>(w.type) << " " << w.idxA << " " << w.idxB << " "
+        << w.radius << "\n";
+
+  // --- Остальные параметры ---
+  out << cfg.emit_wall_index << " " << cfg.emit_wall_t << " "
+      << cfg.emit_angle_deg << "\n";
+  out << cfg.reflectivity << " " << cfg.target_point.x << " "
+      << cfg.target_point.y << " " << cfg.target_radius << "\n";
+  out << cfg.max_reflections << " " << cfg.return_on_hit << "\n";
+
+  return true;
+}
+
+static bool LoadConfig(const std::string& filename, Config& cfg) {
+  std::ifstream in("templates/" + filename);
+  if (!in.is_open()) {
+    // 🔹 Здесь можно вернуть false, но без выброса ошибок — место для проверки:
+    // if (!LoadConfig(...)) { // обработка отсутствия файла }
+    return false;
+  }
+
+  size_t pointsCount = 0;
+  in >> pointsCount;
+  cfg.points.resize(pointsCount);
+  for (auto& p : cfg.points) in >> p.x >> p.y;
+
+  size_t wallsCount = 0;
+  in >> wallsCount;
+  cfg.walls.resize(wallsCount);
+  for (auto& w : cfg.walls) {
+    int typeInt;
+    in >> typeInt >> w.idxA >> w.idxB >> w.radius;
+    w.type = static_cast<WallType>(typeInt);
+    w.center_set = false;  // будет вычислено initializeWalls()
+  }
+
+  in >> cfg.emit_wall_index >> cfg.emit_wall_t >> cfg.emit_angle_deg;
+  in >> cfg.reflectivity >> cfg.target_point.x >> cfg.target_point.y >>
+      cfg.target_radius;
+  in >> cfg.max_reflections >> cfg.return_on_hit;
+
+  return true;
+}
+
+// ------------------- Визуализация SFML -------------------
+
+int main() {
+  Config cfg = buildExampleConfig();
+
+  // Переменные, которые зависят от конфига и определяются динамически
+  bool walls_changed = true;
+  TraceResult trace;
+  std::vector<sf::VertexArray> wall_draws;
+  sf::CircleShape targetCircle((float)cfg.target_radius);
+  std::vector<sf::VertexArray> ray_draws;
+  sf::VertexArray dir_indicator(sf::Lines, 2);
+
+  // Примеры для теста динамики
+  std::vector<std::string> examples = {};
+  int cur_example = 0;
+
+  // SFML окно
+  sf::RenderWindow window(sf::VideoMode(800, 600), "Ray Tracer SFML - Backend");
+  window.setFramerateLimit(60);
+
+  // основное окно
+  while (window.isOpen()) {
+    sf::Event e;
+    while (window.pollEvent(e)) {
+      if (e.type == sf::Event::Closed) window.close();
+      if (e.KeyReleased && e.key.code == sf::Keyboard::Add) {  // Numpad plus
+        walls_changed = true;
+        cur_example = (cur_example + 1) % examples.size();
+
+        LoadConfig(examples[cur_example], cfg);
+      }
+      // Здесь frontend ивенты, типа нажатия мыши и т.п.
+    }
+
+    // Динамический перерасчёт луча
+    if (walls_changed) {
+      trace = TraceResult();
+      wall_draws = {};
+      ray_draws = {};
+      dir_indicator = sf::VertexArray(sf::Lines, 2);
+
+      if (!initializeWalls(cfg)) {
+        std::cerr << "Ошибка инициализации стен\n";
+        return -1;
+      }
+
+      trace = traceRay(cfg);
+
+      for (const WallConfig& w : cfg.walls) {
+        if (w.type == WallType::FLAT) {
+          sf::VertexArray va(sf::LinesStrip, 2);
+          Point A = cfg.points[w.idxA], B = cfg.points[w.idxB];
+          va[0].position = sf::Vector2f((float)A.x, (float)A.y);
+          va[1].position = sf::Vector2f((float)B.x, (float)B.y);
+          va[0].color = sf::Color::White;
+          va[1].color = sf::Color::White;
+          wall_draws.push_back(va);
+        } else {
+          // дуга как ломаная
+          sf::VertexArray va(sf::LinesStrip);
+          int steps = 40;
+          for (int k = 0; k <= steps; ++k) {
+            double t = double(k) / double(steps);
+            double ang = w.angA + w.angDelta * t;
+            Point p(w.center.x + w.radius * std::cos(ang),
+                    w.center.y + w.radius * std::sin(ang));
+            va.append(sf::Vertex(sf::Vector2f((float)p.x, (float)p.y),
+                                 sf::Color::White));
+          }
+          wall_draws.push_back(va);
+        }
+      }
+
+      targetCircle.setRadius((float)cfg.target_radius);
+      targetCircle.setOrigin((float)cfg.target_radius,
+                             (float)cfg.target_radius);
+      targetCircle.setPosition((float)cfg.target_point.x,
+                               (float)cfg.target_point.y);
+      targetCircle.setFillColor(sf::Color(0, 255, 0, 130));
+      targetCircle.setOutlineThickness(0.5f);
+      targetCircle.setOutlineColor(sf::Color::Green);
+
+      for (const RaySegment& s : trace.segments) {
+        sf::VertexArray va(sf::LinesStrip, 2);
+        va[0].position = sf::Vector2f((float)s.a.x, (float)s.a.y);
+        va[1].position = sf::Vector2f((float)s.b.x, (float)s.b.y);
+        // прозрачность зависит от intensity
+        int alpha = (int)std::round(std::min(1.0, s.intensity) * 255.0);
+        if (alpha < 1) alpha = 1;
+        sf::Color c(255, 255, 255, (sf::Uint8)alpha);
+        va[0].color = c;
+        va[1].color = c;
+        ray_draws.push_back(va);
+        // маленький выделяющийся отрезок направления у начальной точки первого
+        // сегмента
+      }
+
+      if (!trace.segments.empty()) {
+        RaySegment first = trace.segments.front();
+        Point dir = norm(first.b - first.a);
+        Point p1 = first.a;
+        Point p2 = first.a + dir * 18.0;
+        dir_indicator[0].position = sf::Vector2f((float)p1.x, (float)p1.y);
+        dir_indicator[1].position = sf::Vector2f((float)p2.x, (float)p2.y);
+        dir_indicator[0].color = sf::Color::Red;
+        dir_indicator[1].color = sf::Color::Red;
+      }
+
+      walls_changed = false;
+    }
+
+    window.clear(sf::Color(30, 30, 30));
+    for (auto& va : wall_draws) window.draw(va);
+    window.draw(targetCircle);
+    for (auto& va : ray_draws) window.draw(va);
+    if (trace.segments.size() > 0) window.draw(dir_indicator);
+    window.display();
+  }
+
+  return 0;
+}
